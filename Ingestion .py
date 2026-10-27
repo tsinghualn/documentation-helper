@@ -1,15 +1,13 @@
 import asyncio
-import hashlib
 import os
 import ssl
 from typing import Any, Dict, List
 import certifi
-import httpx
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
@@ -25,6 +23,19 @@ from logger import (Colors, log_error, log_header, log_info, log_success, log_wa
 ssl_context = ssl.create_default_context(cafile=certifi.where())
 os.environ["SSL_CERT_FILE"] = certifi.where()
 os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
+
+
+#  create a plain vector store index using code, not a document schema index (only form allowed in Pinecone UI now)
+# from pinecone import Pinecone, ServerlessSpec
+
+# pc = Pinecone()
+# pc.create_index(
+#     name="langchain-doc-index",
+#     dimension=1024,
+#     metric="cosine",
+#     vector_type="dense",
+#     spec=ServerlessSpec(cloud="aws", region="us-east-1"),
+# )
 
 embeddings = PineconeEmbeddings(
     model="llama-text-embed-v2",
@@ -122,23 +133,11 @@ async def async_extract(url_batches: List[List[str]]):
     return all_pages
 
 
-@traceable(name="pinecone_documents_upsert", run_type="tool")
-async def upsert_pinecone_documents(documents: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Upsert documents into the Pinecone document index and record a LangSmith run."""
-    index_host = vector_store.index.config.host.rstrip("/")
-    upsert_url = f"{index_host}/namespaces/{NAMESPACE}/documents/upsert"
-    headers = {
-        "Api-Key": os.environ["PINECONE_API_KEY"],
-        "Content-Type": "application/json",
-        "X-Pinecone-Api-Version": "2026-07",
-    }
-    async with httpx.AsyncClient(timeout=120) as client:
-        response = await client.post(
-            upsert_url, headers=headers, json={"documents": documents}
-        )
-    if response.status_code >= 400:
-        raise RuntimeError(f"{response.status_code} {response.text}")
-    return {"status_code": response.status_code, "upserted_count": len(documents)}
+@traceable(name="pinecone_vector_upsert", run_type="tool")
+async def upsert_pinecone_vectors(documents: List[Document]) -> Dict[str, Any]:
+    """Embed documents and upsert them into the Pinecone vector index."""
+    ids = await vector_store.aadd_documents(documents)
+    return {"upserted_count": len(ids)}
 
 
 async def index_documents_async(documents: List[Document], batch_size: int = 50):
@@ -149,8 +148,6 @@ async def index_documents_async(documents: List[Document], batch_size: int = 50)
         Colors.DARKCYAN,
     )
 
-    # This index embeds chunk_text itself and accepts at most 96 documents per request.
-    batch_size = min(batch_size, 96)
     batches = [
         documents[i : i + batch_size] for i in range(0, len(documents), batch_size)
     ]
@@ -161,17 +158,7 @@ async def index_documents_async(documents: List[Document], batch_size: int = 50)
 
     async def add_batch(batch: List[Document], batch_num: int):
         try:
-            documents_payload = [
-                {
-                    "_id": hashlib.sha256(
-                        f"{doc.metadata.get('source', '')}\n{doc.page_content}".encode()
-                    ).hexdigest(),
-                    "chunk_text": doc.page_content,
-                    "source": str(doc.metadata.get("source", "")),
-                }
-                for doc in batch
-            ]
-            await upsert_pinecone_documents(documents_payload)
+            await upsert_pinecone_vectors(batch)
             log_success(
                 f"VectorStore Indexing: Successfully added batch {batch_num}/{len(batches)} ({len(batch)} documents)"
             )
